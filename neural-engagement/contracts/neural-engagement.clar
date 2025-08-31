@@ -14,6 +14,9 @@
 (define-constant ERR-CONTENT-NOT-FOUND (err u110))
 (define-constant ERR-INVALID-BIOMETRIC-SCORE (err u111))
 (define-constant ERR-CAMPAIGN-EXPIRED (err u112))
+(define-constant ERR-ALREADY-SETTLED (err u113))
+(define-constant ERR-NOT-SETTLED (err u114))
+(define-constant ERR-ALREADY-CLAIMED (err u115))
 
 ;; Contract Owner
 (define-data-var contract-owner principal tx-sender)
@@ -139,6 +142,50 @@
 (define-data-var next-content-id uint u1)
 (define-data-var next-campaign-id uint u1)
 
+;; Helper Functions
+(define-private (calculate-tier-benefits (tier uint))
+    (if (is-eq tier u1) u10  ;; casual: 10% benefits
+    (if (is-eq tier u2) u25  ;; active: 25% benefits
+    (if (is-eq tier u3) u50  ;; super: 50% benefits
+        u100)))              ;; vip: 100% benefits
+)
+
+(define-private (calculate-revenue-share (tier uint))
+    (if (is-eq tier u1) u5   ;; casual: 5% revenue share
+    (if (is-eq tier u2) u10  ;; active: 10% revenue share
+    (if (is-eq tier u3) u20  ;; super: 20% revenue share
+        u30)))               ;; vip: 30% revenue share
+)
+
+(define-private (calculate-authenticity-score (biometric uint) (interaction uint))
+    (let ((base-score (/ (+ biometric interaction) u2)))
+        (if (> base-score u90) u95
+        (if (> base-score u70) u80
+        (if (> base-score u50) u65
+            u45)))
+    )
+)
+
+(define-private (calculate-interaction-quality (biometric uint) (interaction uint))
+    (let ((quality-base (/ (+ (* biometric u3) interaction) u4)))
+        (if (> quality-base u80) u90
+        (if (> quality-base u60) u75
+            u50))
+    )
+)
+
+(define-private (calculate-engagement-reward (quality-score uint))
+    (if (> quality-score u80) u1000000  ;; 1 STX for high quality
+    (if (> quality-score u60) u500000   ;; 0.5 STX for medium quality
+        u250000))                       ;; 0.25 STX for basic quality
+)
+
+(define-private (calculate-prediction-reward (predicted-value uint) (stake-amount uint))
+    (let ((multiplier (if (> predicted-value u1000000) u150 u120))) ;; 1.5x or 1.2x multiplier
+        (/ (* stake-amount multiplier) u100)
+    )
+)
+
 ;; Admin Functions
 (define-public (set-platform-fee (new-fee uint))
     (begin
@@ -153,6 +200,13 @@
         (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
         (asserts! (<= new-score u100) ERR-INVALID-ENGAGEMENT-SCORE)
         (ok (var-set min-engagement-score new-score))
+    )
+)
+
+(define-public (transfer-ownership (new-owner principal))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (ok (var-set contract-owner new-owner))
     )
 )
 
@@ -177,9 +231,18 @@
             { creator: creator }
             {
                 current-price: u1000000, ;; 1 STX in microSTX
-                last-update: stacks-block-height,
+                last-update: block-height,
                 price-trend: 0,
                 volume-24h: u0
+            }
+        )
+        (map-set creator-revenue-pools
+            { creator: creator }
+            {
+                immediate-pool: u0,
+                fan-reward-pool: u0,
+                ip-protection-pool: u0,
+                collaboration-pool: u0
             }
         )
         (ok true)
@@ -201,7 +264,7 @@
                 total-contributions: u0,
                 tier-benefits: (calculate-tier-benefits tier),
                 revenue-share-rate: (calculate-revenue-share tier),
-                mint-timestamp: stacks-block-height
+                mint-timestamp: block-height
             }
         )
         
@@ -232,10 +295,20 @@
                     biometric-score: biometric-score,
                     authenticity-score: authenticity-score,
                     interaction-quality: quality-score,
-                    timestamp: stacks-block-height,
+                    timestamp: block-height,
                     verified: (>= authenticity-score u70),
                     reward-earned: (calculate-engagement-reward quality-score)
                 }
+            )
+            
+            ;; Update content engagement count if content exists
+            (match (map-get? content-registry { content-id: content-id })
+                content-data
+                (map-set content-registry
+                    { content-id: content-id }
+                    (merge content-data { engagement-count: (+ (get engagement-count content-data) u1) })
+                )
+                false
             )
             (ok authenticity-score)
         )
@@ -254,7 +327,7 @@
             {
                 creator: creator,
                 content-hash: content-hash,
-                timestamp: stacks-block-height,
+                timestamp: block-height,
                 ip-protected: true,
                 engagement-count: u0,
                 revenue-generated: u0
@@ -280,7 +353,7 @@
     (let 
         ((creator tx-sender)
          (campaign-id (var-get next-campaign-id))
-         (end-time (+ stacks-block-height duration)))
+         (end-time (+ block-height duration)))
         
         (asserts! (is-some (map-get? creators { creator: creator })) ERR-CREATOR-NOT-FOUND)
         (asserts! (> target-metric u0) ERR-INVALID-AMOUNT)
@@ -311,7 +384,7 @@
         (match (map-get? prediction-campaigns { campaign-id: campaign-id })
             campaign-data
             (begin
-                (asserts! (< stacks-block-height (get end-timestamp campaign-data)) ERR-PREDICTION-CLOSED)
+                (asserts! (< block-height (get end-timestamp campaign-data)) ERR-PREDICTION-CLOSED)
                 
                 (map-set fan-predictions
                     { campaign-id: campaign-id, fan: fan }
@@ -328,4 +401,152 @@
                     (merge campaign-data 
                         { 
                             prediction-pool: (+ (get prediction-pool campaign-data) stake-amount),
-                            total-stakes: (+ (get total-stakes campaign-data) u1
+                            total-stakes: (+ (get total-stakes campaign-data) u1)
+                        }
+                    )
+                )
+                (ok true)
+            )
+            ERR-CONTENT-NOT-FOUND
+        )
+    )
+)
+
+(define-public (settle-prediction-campaign (campaign-id uint) (actual-result uint))
+    (let ((settler tx-sender))
+        (match (map-get? prediction-campaigns { campaign-id: campaign-id })
+            campaign-data
+            (begin
+                (asserts! (is-eq settler (get creator campaign-data)) ERR-NOT-AUTHORIZED)
+                (asserts! (>= block-height (get end-timestamp campaign-data)) ERR-CAMPAIGN-EXPIRED)
+                (asserts! (not (get settled campaign-data)) ERR-ALREADY-SETTLED)
+                
+                (map-set prediction-campaigns
+                    { campaign-id: campaign-id }
+                    (merge campaign-data 
+                        { 
+                            actual-result: actual-result,
+                            settled: true
+                        }
+                    )
+                )
+                (ok true)
+            )
+            ERR-CONTENT-NOT-FOUND
+        )
+    )
+)
+
+(define-public (claim-prediction-reward (campaign-id uint))
+    (let ((fan tx-sender))
+        (match (map-get? fan-predictions { campaign-id: campaign-id, fan: fan })
+            prediction-data
+            (match (map-get? prediction-campaigns { campaign-id: campaign-id })
+                campaign-data
+                (begin
+                    (asserts! (get settled campaign-data) ERR-NOT-SETTLED)
+                    (asserts! (not (get claimed prediction-data)) ERR-ALREADY-CLAIMED)
+                    
+                    (let ((accuracy (calculate-prediction-accuracy 
+                                        (get predicted-value prediction-data) 
+                                        (get actual-result campaign-data))))
+                        (if (> accuracy u80) ;; High accuracy threshold
+                            (begin
+                                (map-set fan-predictions
+                                    { campaign-id: campaign-id, fan: fan }
+                                    (merge prediction-data { claimed: true })
+                                )
+                                (ok (get potential-reward prediction-data))
+                            )
+                            (ok u0) ;; No reward for low accuracy
+                        )
+                    )
+                )
+                ERR-CONTENT-NOT-FOUND
+            )
+            ERR-CONTENT-NOT-FOUND
+        )
+    )
+)
+
+(define-private (calculate-prediction-accuracy (predicted uint) (actual uint))
+    (let ((difference (if (> predicted actual) 
+                          (- predicted actual) 
+                          (- actual predicted)))
+          (percentage-diff (/ (* difference u100) actual)))
+        (if (<= percentage-diff u10) u100  ;; 100% accuracy for <10% difference
+        (if (<= percentage-diff u20) u85   ;; 85% accuracy for <20% difference
+        (if (<= percentage-diff u50) u60   ;; 60% accuracy for <50% difference
+            u0)))                          ;; 0% accuracy for >50% difference
+    )
+)
+
+(define-public (update-engagement-credits (platform (string-ascii 20)) (credits uint))
+    (let ((user tx-sender))
+        (match (map-get? engagement-credits { user: user })
+            current-credits
+            (let ((new-total (+ (get total-credits current-credits) credits)))
+                (map-set engagement-credits
+                    { user: user }
+                    (merge current-credits { total-credits: new-total })
+                )
+                (ok new-total)
+            )
+            (begin
+                (map-set engagement-credits
+                    { user: user }
+                    {
+                        twitter-credits: (if (is-eq platform "twitter") credits u0),
+                        instagram-credits: (if (is-eq platform "instagram") credits u0),
+                        tiktok-credits: (if (is-eq platform "tiktok") credits u0),
+                        youtube-credits: (if (is-eq platform "youtube") credits u0),
+                        total-credits: credits,
+                        conversion-rate: u100
+                    }
+                )
+                (ok credits)
+            )
+        )
+    )
+)
+
+;; Read-only functions
+(define-read-only (get-creator-info (creator principal))
+    (map-get? creators { creator: creator })
+)
+
+(define-read-only (get-engagement-nft (creator principal) (fan principal))
+    (map-get? engagement-nfts { creator: creator, fan: fan })
+)
+
+(define-read-only (get-content-info (content-id uint))
+    (map-get? content-registry { content-id: content-id })
+)
+
+(define-read-only (get-prediction-campaign (campaign-id uint))
+    (map-get? prediction-campaigns { campaign-id: campaign-id })
+)
+
+(define-read-only (get-fan-prediction (campaign-id uint) (fan principal))
+    (map-get? fan-predictions { campaign-id: campaign-id, fan: fan })
+)
+
+(define-read-only (get-engagement-proof (user principal) (content-id uint))
+    (map-get? engagement-proofs { user: user, content-id: content-id })
+)
+
+(define-read-only (get-contract-owner)
+    (var-get contract-owner)
+)
+
+(define-read-only (get-platform-fee-rate)
+    (var-get platform-fee-rate)
+)
+
+(define-read-only (get-next-content-id)
+    (var-get next-content-id)
+)
+
+(define-read-only (get-next-campaign-id)
+    (var-get next-campaign-id)
+)
